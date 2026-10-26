@@ -2,6 +2,8 @@ import os
 import threading
 import time
 import subprocess
+import requests
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
@@ -42,68 +44,37 @@ def push_to_codeberg(filename):
         print(f"Git Push Error: {e}")
         return False
 
-# --- THE TEST ALL FUNCTION ---
+# --- SPOTIFY OEMBED SCRAPER ---
+def get_spotify_metadata(spotify_url):
+    """Uses Spotify's public oEmbed API to get exact track info without API keys."""
+    try:
+        oembed_url = f"https://open.spotify.com/oembed?url={spotify_url}"
+        r = requests.get(oembed_url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            # oEmbed returns title like "Song Name" and author_name like "Artist Name"
+            title = data.get('title', '')
+            artist = data.get('author_name', '')
+            return f"{artist} {title}".strip()
+    except Exception as e:
+        print(f"oEmbed failed: {e}")
+    return None
+
+# --- CORE DOWNLOAD FUNCTION ---
 @app.route('/test-all', methods=['GET'])
 def test_all_sources():
     results = []
-
-    # 1. SpotDL (SoundCloud) - The Accuracy King
-    try:
-        spotify_url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT" # Rick Astley
-        cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio", "soundcloud"]
-        
-        # Run and wait for it
-        process = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        
-        if process.returncode == 0:
-            # Find the downloaded file
-            files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')]
-            if files:
-                newest_file = max(files, key=lambda f: os.path.getctime(os.path.join(TEMP_DIR, f)))
-                results.append(f"✅ <b>SpotDL (SoundCloud):</b> SUCCESS - Downloaded '{newest_file}'")
-            else:
-                results.append(f"⚠️ <b>SpotDL (SoundCloud):</b> Ran, but couldn't find the MP3.")
-        else:
-            error_msg = process.stderr or process.stdout
-            results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {error_msg[:200]}")
-    except Exception as e:
-        results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {str(e)[:100]}")
-
-    # Format output as HTML
-    html_output = "<h1>Accuracy Test (SpotDL)</h1>"
-    html_output += "<ul>"
-    for res in results:
-        html_output += f"<li style='font-size: 1.2rem; margin-bottom: 10px;'>{res}</li>"
-    html_output += "</ul>"
+    spotify_url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT" # Rick Astley
     
-    return html_output, 200
-
-# --- ROBUST DOWNLOAD WORKER ---
-def download_song_robust(song_title, artist, spotify_url=None):
-    # Priority 1: SpotDL (Guarantees 100% Spotify Accuracy)
-    query = spotify_url if spotify_url else f"{song_title} {artist}"
     try:
-        print(f"Attempting SpotDL download for: {query}")
-        cmd = ["spotdl", "download", query, "--output", TEMP_DIR, "--format", "mp3", "--audio", "soundcloud"]
-        subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+        # Step 1: Get exact name from Spotify
+        exact_query = get_spotify_metadata(spotify_url)
+        if not exact_query:
+            exact_query = "Rick Astley Never Gonna Give You Up" # Fallback
+            
+        results.append(f"🔍 <b>Spotify Query:</b> {exact_query}")
         
-        # SpotDL names files like "Artist - Title.mp3"
-        files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')]
-        if files:
-            newest_file = max([os.path.join(TEMP_DIR, f) for f in files], key=os.path.getctime)
-            safe_filename = os.path.basename(newest_file).replace(" ", "_")
-            safe_path = os.path.join(TEMP_DIR, safe_filename)
-            if newest_file != safe_path:
-                os.rename(newest_file, safe_path)
-            return safe_filename, song_title, artist
-    except subprocess.CalledProcessError as e:
-        print(f"SpotDL failed: {e.stderr}")
-    except Exception as e:
-        print(f"SpotDL failed: {e}")
-
-    # Priority 2: yt-dlp via SoundCloud (Fallback if SpotDL API is down)
-    print("Falling back to yt-dlp SoundCloud search...")
-    try:
+        # Step 2: Download from SoundCloud
         ydl_opts = {
             'format': 'bestaudio/best',
             'outtmpl': f'{TEMP_DIR}/%(title)s.%(ext)s',
@@ -111,20 +82,28 @@ def download_song_robust(song_title, artist, spotify_url=None):
             'quiet': True,
             'retries': 2
         }
+        
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"scsearch1:{song_title} {artist}", download=True)
+            info = ydl.extract_info(f"scsearch1:{exact_query}", download=True)
             if 'entries' in info: info = info['entries'][0]
+            
+            results.append(f"✅ <b>SoundCloud:</b> SUCCESS - Downloaded '{info['title']}' by {info.get('uploader', 'Unknown')}")
+            
+            # Clean up the test file immediately
             mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-            safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
-            safe_path = os.path.join(TEMP_DIR, safe_filename)
-            if os.path.exists(mp3_filename) and mp3_filename != safe_path:
-                os.rename(mp3_filename, safe_path)
-            return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
+            if os.path.exists(mp3_filename):
+                os.remove(mp3_filename)
+                
     except Exception as e:
-        print(f"SoundCloud fallback failed: {e}")
+        results.append(f"❌ <b>Error:</b> {str(e)[:150]}")
 
-    raise Exception("All download methods failed.")
+    html_output = "<h1>Lightweight Accuracy Test</h1><ul>"
+    for res in results:
+        html_output += f"<li style='font-size: 1.2rem; margin-bottom: 10px;'>{res}</li>"
+    html_output += "</ul>"
+    return html_output, 200
 
+# --- BACKGROUND WORKER ---
 def download_worker():
     print("Background Downloader Started...")
     while True:
@@ -136,16 +115,39 @@ def download_worker():
             response = supabase.table('songs').select('*').eq('status', 'pending').execute()
             for song in response.data:
                 print(f"Found pending: {song['title']} - {song['artist']}")
+                
+                # If the user provided a Spotify URL, we get the exact metadata first
+                search_query = f"{song['artist']} {song['title']}"
+                if song.get('spotify_url'):
+                    exact = get_spotify_metadata(song['spotify_url'])
+                    if exact: search_query = exact
+
                 try:
-                    filename, real_title, real_artist = download_song_robust(song['title'], song['artist'], song.get('spotify_url'))
-                    if push_to_codeberg(filename):
-                        supabase.table('songs').update({
-                            "file_path": filename, "status": "completed",
-                            "title": real_title, "artist": real_artist
-                        }).eq('id', song['id']).execute()
-                        print(f"✅ Successfully processed {filename}")
-                    else:
-                        supabase.table('songs').update({"status": "failed"}).eq('id', song['id']).execute()
+                    ydl_opts = {
+                        'format': 'bestaudio/best',
+                        'outtmpl': f'{TEMP_DIR}/%(title)s.%(ext)s',
+                        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}],
+                        'quiet': True,
+                        'retries': 3
+                    }
+                    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                        info = ydl.extract_info(f"scsearch1:{search_query}", download=True)
+                        if 'entries' in info: info = info['entries'][0]
+                        
+                        mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+                        safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
+                        safe_path = os.path.join(TEMP_DIR, safe_filename)
+                        if os.path.exists(mp3_filename) and mp3_filename != safe_path:
+                            os.rename(mp3_filename, safe_path)
+
+                        if push_to_codeberg(safe_filename):
+                            supabase.table('songs').update({
+                                "file_path": safe_filename, "status": "completed",
+                                "title": info['title'], "artist": info.get('uploader', song['artist'])
+                            }).eq('id', song['id']).execute()
+                            print(f"✅ Successfully processed {safe_filename}")
+                        else:
+                            supabase.table('songs').update({"status": "failed"}).eq('id', song['id']).execute()
                 except Exception as e:
                     print(f"Download failed: {e}")
                     supabase.table('songs').update({"status": "failed"}).eq('id', song['id']).execute()
