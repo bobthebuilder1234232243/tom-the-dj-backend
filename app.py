@@ -55,10 +55,13 @@ def get_ydl_opts():
         'extractor_args': {
             'youtubepot-bgutilhttp': {
                 'base_url': ['http://127.0.0.1:4416']
+            },
+            'youtube': {
+                'player_client': ['web', 'mweb'] 
             }
         },
-        'retries': 3,
-        'fragment_retries': 3,
+        'retries': 10,
+        'fragment_retries': 10,
         'sleep_interval': 5,
     }
 
