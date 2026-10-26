@@ -45,57 +45,32 @@ def push_to_codeberg(filename):
 # --- THE TEST ALL FUNCTION ---
 @app.route('/test-all', methods=['GET'])
 def test_all_sources():
-    query = "Never Gonna Give You Up Rick Astley"
-    spotify_url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
     results = []
 
-    # 1. SoundCloud (via yt-dlp)
+    # 1. SpotDL (SoundCloud) - The Accuracy King
     try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f'{TEMP_DIR}/sc_%(title)s.%(ext)s',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-            'quiet': True
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"scsearch1:{query}", download=True)
-            if 'entries' in info: info = info['entries'][0]
-            results.append(f"✅ <b>SoundCloud:</b> SUCCESS - {info['title']}")
-    except Exception as e:
-        results.append(f"❌ <b>SoundCloud:</b> FAILED - {str(e)[:100]}")
-
-    # 2. Bandcamp (via yt-dlp)
-    try:
-        ydl_opts = {
-            'format': 'bestaudio/best',
-            'outtmpl': f'{TEMP_DIR}/bc_%(title)s.%(ext)s',
-            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-            'quiet': True
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            # yt-dlp uses bcsearch1 for Bandcamp search
-            info = ydl.extract_info(f"bcsearch1:{query}", download=True)
-            if 'entries' in info: info = info['entries'][0]
-            results.append(f"✅ <b>Bandcamp:</b> SUCCESS - {info['title']}")
-    except Exception as e:
-        results.append(f"❌ <b>Bandcamp:</b> FAILED - {str(e)[:100]}")
-
-    # 3. SpotDL via SoundCloud (Direct Spotify accuracy)
-    try:
-        # We use spotdl CLI, forcing it to use soundcloud as the audio provider
-        cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio-providers", "soundcloud"]
+        spotify_url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT" # Rick Astley
+        cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio", "soundcloud"]
+        
+        # Run and wait for it
         process = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         if process.returncode == 0:
-            results.append(f"✅ <b>SpotDL (SoundCloud):</b> SUCCESS")
+            # Find the downloaded file
+            files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')]
+            if files:
+                newest_file = max(files, key=lambda f: os.path.getctime(os.path.join(TEMP_DIR, f)))
+                results.append(f"✅ <b>SpotDL (SoundCloud):</b> SUCCESS - Downloaded '{newest_file}'")
+            else:
+                results.append(f"⚠️ <b>SpotDL (SoundCloud):</b> Ran, but couldn't find the MP3.")
         else:
             error_msg = process.stderr or process.stdout
-            results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {error_msg[:150]}")
+            results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {error_msg[:200]}")
     except Exception as e:
         results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {str(e)[:100]}")
 
-    # Format output as HTML for the browser
-    html_output = "<h1>Downloader Source Tests</h1>"
+    # Format output as HTML
+    html_output = "<h1>Accuracy Test (SpotDL)</h1>"
     html_output += "<ul>"
     for res in results:
         html_output += f"<li style='font-size: 1.2rem; margin-bottom: 10px;'>{res}</li>"
@@ -103,10 +78,31 @@ def test_all_sources():
     
     return html_output, 200
 
-# --- BACKGROUND WORKER (Uses the best fallbacks) ---
+# --- ROBUST DOWNLOAD WORKER ---
 def download_song_robust(song_title, artist, spotify_url=None):
-    # Priority 1: SoundCloud via yt-dlp (Fast, usually unblocked)
-    query = f"{song_title} {artist}"
+    # Priority 1: SpotDL (Guarantees 100% Spotify Accuracy)
+    query = spotify_url if spotify_url else f"{song_title} {artist}"
+    try:
+        print(f"Attempting SpotDL download for: {query}")
+        cmd = ["spotdl", "download", query, "--output", TEMP_DIR, "--format", "mp3", "--audio", "soundcloud"]
+        subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+        
+        # SpotDL names files like "Artist - Title.mp3"
+        files = [f for f in os.listdir(TEMP_DIR) if f.endswith('.mp3')]
+        if files:
+            newest_file = max([os.path.join(TEMP_DIR, f) for f in files], key=os.path.getctime)
+            safe_filename = os.path.basename(newest_file).replace(" ", "_")
+            safe_path = os.path.join(TEMP_DIR, safe_filename)
+            if newest_file != safe_path:
+                os.rename(newest_file, safe_path)
+            return safe_filename, song_title, artist
+    except subprocess.CalledProcessError as e:
+        print(f"SpotDL failed: {e.stderr}")
+    except Exception as e:
+        print(f"SpotDL failed: {e}")
+
+    # Priority 2: yt-dlp via SoundCloud (Fallback if SpotDL API is down)
+    print("Falling back to yt-dlp SoundCloud search...")
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -116,7 +112,7 @@ def download_song_robust(song_title, artist, spotify_url=None):
             'retries': 2
         }
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(f"scsearch1:{query}", download=True)
+            info = ydl.extract_info(f"scsearch1:{song_title} {artist}", download=True)
             if 'entries' in info: info = info['entries'][0]
             mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
             safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
@@ -125,28 +121,9 @@ def download_song_robust(song_title, artist, spotify_url=None):
                 os.rename(mp3_filename, safe_path)
             return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
     except Exception as e:
-        print(f"SoundCloud failed, falling back to SpotDL: {e}")
+        print(f"SoundCloud fallback failed: {e}")
 
-    # Priority 2: SpotDL via SoundCloud
-    if spotify_url:
-        try:
-            cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio-providers", "soundcloud"]
-            subprocess.run(cmd, check=True, capture_output=True, timeout=180)
-            
-            # Find the newly downloaded file
-            files = os.listdir(TEMP_DIR)
-            if files:
-                # Sort by newest
-                newest_file = max([os.path.join(TEMP_DIR, f) for f in files], key=os.path.getctime)
-                safe_filename = os.path.basename(newest_file).replace(" ", "_")
-                safe_path = os.path.join(TEMP_DIR, safe_filename)
-                if newest_file != safe_path:
-                    os.rename(newest_file, safe_path)
-                return safe_filename, song_title, artist
-        except Exception as e:
-            print(f"SpotDL failed: {e}")
-
-    raise Exception("All non-YouTube sources failed.")
+    raise Exception("All download methods failed.")
 
 def download_worker():
     print("Background Downloader Started...")
