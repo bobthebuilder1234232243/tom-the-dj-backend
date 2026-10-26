@@ -2,7 +2,6 @@ import os
 import threading
 import time
 import subprocess
-import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
@@ -18,21 +17,6 @@ supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE
 CODEBERG_REPO = "https://math123934:a7856ae1941636a3f6790971ded54722237a4fb1@codeberg.org/Math123934/Tom-The-DJ.git"
 TEMP_DIR = "/tmp/downloads"
 if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
-
-# --- SECURE COOKIE LOADER ---
-COOKIE_PATH = "/tmp/cookies.txt"
-COOKIE_B64 = os.environ.get("YOUTUBE_COOKIES_B64")
-
-if COOKIE_B64:
-    try:
-        decoded_cookies = base64.b64decode(COOKIE_B64).decode('utf-8')
-        with open(COOKIE_PATH, 'w') as f:
-            f.write(decoded_cookies)
-        print("✅ YouTube cookies loaded successfully from environment variable.")
-    except Exception as e:
-        print(f"❌ Failed to decode YouTube cookies: {e}")
-else:
-    print("⚠️ No YouTube cookies found in environment variables.")
 
 # --- GIT PUSH LOGIC ---
 def push_to_codeberg(filename):
@@ -58,42 +42,81 @@ def push_to_codeberg(filename):
         print(f"Git Push Error: {e}")
         return False
 
-# --- CORE DOWNLOAD FUNCTION ---
-def get_ydl_opts():
-    opts = {
-        'format': 'bestaudio/best',
-        'outtmpl': f'{TEMP_DIR}/%(title)s.%(ext)s',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '320',
-        }],
-        'quiet': True,
-        'js_runtimes': {'deno': {}},
-        'extractor_args': {
-            'youtubepot-bgutilhttp': {
-                'base_url': ['http://127.0.0.1:4416']
-            },
-            'youtube': {
-                'player_client': ['mweb', 'tv'] # Best clients to use with cookies
-            }
-        },
-        'retries': 5,
-        'fragment_retries': 5,
-        'sleep_interval': 5,
-    }
-    
-    # Only add the cookiefile if it actually exists
-    if os.path.exists(COOKIE_PATH):
-        opts['cookiefile'] = COOKIE_PATH
-        
-    return opts
+# --- THE TEST ALL FUNCTION ---
+@app.route('/test-all', methods=['GET'])
+def test_all_sources():
+    query = "Never Gonna Give You Up Rick Astley"
+    spotify_url = "https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT"
+    results = []
 
-def download_song(song_title, artist, spotify_url=None):
-    url = spotify_url if spotify_url else f"ytsearch1:{song_title} {artist} official audio"
+    # 1. SoundCloud (via yt-dlp)
     try:
-        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
-            info = ydl.extract_info(url, download=True)
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': f'{TEMP_DIR}/sc_%(title)s.%(ext)s',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+            'quiet': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"scsearch1:{query}", download=True)
+            if 'entries' in info: info = info['entries'][0]
+            results.append(f"✅ <b>SoundCloud:</b> SUCCESS - {info['title']}")
+    except Exception as e:
+        results.append(f"❌ <b>SoundCloud:</b> FAILED - {str(e)[:100]}")
+
+    # 2. Bandcamp (via yt-dlp)
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': f'{TEMP_DIR}/bc_%(title)s.%(ext)s',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
+            'quiet': True
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            # yt-dlp uses bcsearch1 for Bandcamp search
+            info = ydl.extract_info(f"bcsearch1:{query}", download=True)
+            if 'entries' in info: info = info['entries'][0]
+            results.append(f"✅ <b>Bandcamp:</b> SUCCESS - {info['title']}")
+    except Exception as e:
+        results.append(f"❌ <b>Bandcamp:</b> FAILED - {str(e)[:100]}")
+
+    # 3. SpotDL via SoundCloud (Direct Spotify accuracy)
+    try:
+        # We use spotdl CLI, forcing it to use soundcloud as the audio provider
+        cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio-providers", "soundcloud"]
+        process = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        
+        if process.returncode == 0:
+            results.append(f"✅ <b>SpotDL (SoundCloud):</b> SUCCESS")
+        else:
+            error_msg = process.stderr or process.stdout
+            results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {error_msg[:150]}")
+    except Exception as e:
+        results.append(f"❌ <b>SpotDL (SoundCloud):</b> FAILED - {str(e)[:100]}")
+
+    # Format output as HTML for the browser
+    html_output = "<h1>Downloader Source Tests</h1>"
+    html_output += "<ul>"
+    for res in results:
+        html_output += f"<li style='font-size: 1.2rem; margin-bottom: 10px;'>{res}</li>"
+    html_output += "</ul>"
+    
+    return html_output, 200
+
+# --- BACKGROUND WORKER (Uses the best fallbacks) ---
+def download_song_robust(song_title, artist, spotify_url=None):
+    # Priority 1: SoundCloud via yt-dlp (Fast, usually unblocked)
+    query = f"{song_title} {artist}"
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': f'{TEMP_DIR}/%(title)s.%(ext)s',
+            'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '320'}],
+            'quiet': True,
+            'retries': 2
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"scsearch1:{query}", download=True)
             if 'entries' in info: info = info['entries'][0]
             mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
             safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
@@ -102,44 +125,29 @@ def download_song(song_title, artist, spotify_url=None):
                 os.rename(mp3_filename, safe_path)
             return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
     except Exception as e:
-        print(f"Download failed: {e}")
-        raise e
+        print(f"SoundCloud failed, falling back to SpotDL: {e}")
 
-# --- ROUTES ---
-@app.route('/test', methods=['GET'])
-def test_pipeline():
-    try:
-        filename, title, artist = download_song("Never Gonna Give You Up", "Rick Astley", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        if push_to_codeberg(filename):
-            return f"✅ SUCCESS! Downloaded '{title}' and pushed to Codeberg.", 200
-        else:
-            return "❌ Downloaded, but failed to push to Codeberg.", 500
-    except Exception as e:
-        return f"❌ ERROR: {str(e)}", 500
+    # Priority 2: SpotDL via SoundCloud
+    if spotify_url:
+        try:
+            cmd = ["spotdl", "download", spotify_url, "--output", TEMP_DIR, "--format", "mp3", "--audio-providers", "soundcloud"]
+            subprocess.run(cmd, check=True, capture_output=True, timeout=180)
+            
+            # Find the newly downloaded file
+            files = os.listdir(TEMP_DIR)
+            if files:
+                # Sort by newest
+                newest_file = max([os.path.join(TEMP_DIR, f) for f in files], key=os.path.getctime)
+                safe_filename = os.path.basename(newest_file).replace(" ", "_")
+                safe_path = os.path.join(TEMP_DIR, safe_filename)
+                if newest_file != safe_path:
+                    os.rename(newest_file, safe_path)
+                return safe_filename, song_title, artist
+        except Exception as e:
+            print(f"SpotDL failed: {e}")
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files: return jsonify({"error": "No file part"}), 400
-    file = request.files['file']
-    playlist_id = request.form.get('playlist_id')
-    if file.filename == '': return jsonify({"error": "No selected file"}), 400
-    safe_filename = file.filename.replace(" ", "_")
-    file_path = os.path.join(TEMP_DIR, safe_filename)
-    file.save(file_path)
-    
-    if push_to_codeberg(safe_filename):
-        if supabase:
-            supabase.table('songs').insert({
-                "playlist_id": playlist_id,
-                "title": request.form.get('title', 'Unknown Title'),
-                "artist": request.form.get('artist', 'Unknown Artist'),
-                "file_path": safe_filename,
-                "status": "completed"
-            }).execute()
-        return jsonify({"message": "File uploaded successfully"}), 200
-    return jsonify({"error": "Failed to push to storage"}), 500
+    raise Exception("All non-YouTube sources failed.")
 
-# --- BACKGROUND WORKER ---
 def download_worker():
     print("Background Downloader Started...")
     while True:
@@ -152,7 +160,7 @@ def download_worker():
             for song in response.data:
                 print(f"Found pending: {song['title']} - {song['artist']}")
                 try:
-                    filename, real_title, real_artist = download_song(song['title'], song['artist'], song.get('spotify_url'))
+                    filename, real_title, real_artist = download_song_robust(song['title'], song['artist'], song.get('spotify_url'))
                     if push_to_codeberg(filename):
                         supabase.table('songs').update({
                             "file_path": filename, "status": "completed",
