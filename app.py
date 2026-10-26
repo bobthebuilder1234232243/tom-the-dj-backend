@@ -41,7 +41,6 @@ def push_to_codeberg(filename):
         print(f"Git Push Error: {e}")
         return False
 
-# Helper function to get the correct yt-dlp options
 def get_ydl_opts():
     return {
         'format': 'bestaudio/best',
@@ -52,15 +51,15 @@ def get_ydl_opts():
             'preferredquality': '320',
         }],
         'quiet': True,
-        'js_runtimes': ['deno'], # Tell yt-dlp to use Deno
+        'js_runtimes': {'deno': {}},
         'extractor_args': {
-            'youtube': {
-                'pot_provider': 'bgutil', # Use the PO Token provider
+            'youtubepot-bgutilhttp': {
+                'base_url': ['http://127.0.0.1:4416']
             }
         },
         'retries': 3,
         'fragment_retries': 3,
-        'sleep_interval': 5, # Wait 5s between downloads to avoid 429
+        'sleep_interval': 5,
     }
 
 @app.route('/test', methods=['GET'])
@@ -80,7 +79,7 @@ def test_pipeline():
             if push_to_codeberg(safe_filename):
                 return "✅ SUCCESS! Video downloaded and pushed to Codeberg.", 200
             else:
-                return "❌ Downloaded, but failed to push to Codeberg.", 500
+                return "❌ Downloaded, but failed to push to Codeberg. Check logs.", 500
     except Exception as e:
         return f"❌ ERROR: {str(e)}", 500
 
@@ -95,14 +94,15 @@ def upload_file():
     file_path = os.path.join(TEMP_DIR, safe_filename)
     file.save(file_path)
 
-    if push_to_codeberg(safe_filename) and supabase:
-        supabase.table('songs').insert({
-            "playlist_id": playlist_id,
-            "title": request.form.get('title', 'Unknown Title'),
-            "artist": request.form.get('artist', 'Unknown Artist'),
-            "file_path": safe_filename,
-            "status": "completed"
-        }).execute()
+    if push_to_codeberg(safe_filename):
+        if supabase:
+            supabase.table('songs').insert({
+                "playlist_id": playlist_id,
+                "title": request.form.get('title', 'Unknown Title'),
+                "artist": request.form.get('artist', 'Unknown Artist'),
+                "file_path": safe_filename,
+                "status": "completed"
+            }).execute()
         return jsonify({"message": "File uploaded successfully"}), 200
     return jsonify({"error": "Failed to push to storage"}), 500
 
@@ -110,37 +110,53 @@ def download_worker():
     print("Background Downloader Started...")
     while True:
         if not supabase:
-            time.sleep(10); continue
+            time.sleep(10)
+            continue
+
         try:
             response = supabase.table('songs').select('*').eq('status', 'pending').execute()
-            for song in response.data:
+            pending_songs = response.data
+
+            for song in pending_songs:
                 print(f"Found pending: {song['title']} - {song['artist']}")
                 
-                url = song.get('spotify_url') or f"ytsearch1:{song['title']} {song['artist']} official audio"
+                url = song.get('spotify_url')
+                if not url:
+                    search_query = f"{song['title']} {song['artist']} official audio"
+                    url = f"ytsearch1:{search_query}"
                 
                 try:
                     with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
                         info = ydl.extract_info(url, download=True)
-                        if 'entries' in info: info = info['entries'][0]
+                        if 'entries' in info:
+                            info = info['entries'][0]
                         
-                        mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
+                        raw_filename = ydl.prepare_filename(info)
+                        mp3_filename = os.path.splitext(raw_filename)[0] + ".mp3"
                         safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
+                        
                         safe_path = os.path.join(TEMP_DIR, safe_filename)
                         if os.path.exists(mp3_filename) and mp3_filename != safe_path:
                             os.rename(mp3_filename, safe_path)
 
-                        if push_to_codeberg(safe_filename):
+                        push_success = push_to_codeberg(safe_filename)
+
+                        if push_success:
                             supabase.table('songs').update({
-                                "file_path": safe_filename, "status": "completed"
+                                "file_path": safe_filename,
+                                "status": "completed"
                             }).eq('id', song['id']).execute()
                             print(f"Successfully processed {safe_filename}")
                         else:
                             supabase.table('songs').update({"status": "failed"}).eq('id', song['id']).execute()
+                            
                 except Exception as e:
                     print(f"Download failed: {e}")
                     supabase.table('songs').update({"status": "failed"}).eq('id', song['id']).execute()
+
         except Exception as e:
             print(f"Worker Error: {e}")
+            
         time.sleep(10)
 
 threading.Thread(target=download_worker, daemon=True).start()
