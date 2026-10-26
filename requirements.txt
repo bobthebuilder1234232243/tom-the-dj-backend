@@ -1,0 +1,6 @@
+flask
+flask-cors
+supabase
+yt-dlp
+spotdl
+requests
