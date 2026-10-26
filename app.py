@@ -2,7 +2,7 @@ import os
 import threading
 import time
 import subprocess
-import requests
+import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from supabase import create_client
@@ -11,7 +11,7 @@ import yt_dlp
 app = Flask(__name__)
 CORS(app)
 
-SUPABASE_URL = "https://wdqrwtdktnfanejftqr.supabase.co"
+SUPABASE_URL = "https://wdqrwtdktnfanehjftqr.supabase.co"
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY) if SUPABASE_SERVICE_KEY else None
 
@@ -19,31 +19,48 @@ CODEBERG_REPO = "https://math123934:a7856ae1941636a3f6790971ded54722237a4fb1@cod
 TEMP_DIR = "/tmp/downloads"
 if not os.path.exists(TEMP_DIR): os.makedirs(TEMP_DIR)
 
-# --- HELPER: Push to Codeberg ---
+# --- SECURE COOKIE LOADER ---
+COOKIE_PATH = "/tmp/cookies.txt"
+COOKIE_B64 = os.environ.get("YOUTUBE_COOKIES_B64")
+
+if COOKIE_B64:
+    try:
+        decoded_cookies = base64.b64decode(COOKIE_B64).decode('utf-8')
+        with open(COOKIE_PATH, 'w') as f:
+            f.write(decoded_cookies)
+        print("✅ YouTube cookies loaded successfully from environment variable.")
+    except Exception as e:
+        print(f"❌ Failed to decode YouTube cookies: {e}")
+else:
+    print("⚠️ No YouTube cookies found in environment variables.")
+
+# --- GIT PUSH LOGIC ---
 def push_to_codeberg(filename):
     try:
         repo_dir = "/tmp/codeberg_repo"
         if not os.path.exists(repo_dir):
             subprocess.run(["git", "clone", CODEBERG_REPO, repo_dir], check=True)
         subprocess.run(["git", "pull", "origin", "main"], cwd=repo_dir, check=True)
+        
         source_file = os.path.join(TEMP_DIR, filename)
         dest_file = os.path.join(repo_dir, filename)
         subprocess.run(["cp", source_file, dest_file], check=True)
+        
         subprocess.run(["git", "add", filename], cwd=repo_dir, check=True)
         subprocess.run(["git", "config", "user.email", "wen8395023@gmail.com"], cwd=repo_dir, check=True)
         subprocess.run(["git", "config", "user.name", "math123934"], cwd=repo_dir, check=True)
         subprocess.run(["git", "commit", "-m", f"Auto-uploaded: {filename}"], cwd=repo_dir, check=True)
         subprocess.run(["git", "push", "origin", "main"], cwd=repo_dir, check=True)
+        
         if os.path.exists(source_file): os.remove(source_file)
         return True
     except Exception as e:
         print(f"Git Push Error: {e}")
         return False
 
-# --- CORE: Multi-Tier Download Function ---
-def download_song(song_title, artist, spotify_url=None):
-    # Base options
-    base_opts = {
+# --- CORE DOWNLOAD FUNCTION ---
+def get_ydl_opts():
+    opts = {
         'format': 'bestaudio/best',
         'outtmpl': f'{TEMP_DIR}/%(title)s.%(ext)s',
         'postprocessors': [{
@@ -56,20 +73,26 @@ def download_song(song_title, artist, spotify_url=None):
         'extractor_args': {
             'youtubepot-bgutilhttp': {
                 'base_url': ['http://127.0.0.1:4416']
+            },
+            'youtube': {
+                'player_client': ['mweb', 'tv'] # Best clients to use with cookies
             }
         },
-        'retries': 2,
-        'fragment_retries': 2,
-        'sleep_interval': 3,
+        'retries': 5,
+        'fragment_retries': 5,
+        'sleep_interval': 5,
     }
+    
+    # Only add the cookiefile if it actually exists
+    if os.path.exists(COOKIE_PATH):
+        opts['cookiefile'] = COOKIE_PATH
+        
+    return opts
 
-    # --- Tier 1: android_vr client (JS-less) ---
-    print("Tier 1: Trying android_vr client...")
-    opts = base_opts.copy()
-    opts['extractor_args'] = {**base_opts['extractor_args'], 'youtube': {'player_client': ['android_vr']}}
+def download_song(song_title, artist, spotify_url=None):
+    url = spotify_url if spotify_url else f"ytsearch1:{song_title} {artist} official audio"
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            url = spotify_url if spotify_url else f"ytsearch1:{song_title} {artist} official audio"
+        with yt_dlp.YoutubeDL(get_ydl_opts()) as ydl:
             info = ydl.extract_info(url, download=True)
             if 'entries' in info: info = info['entries'][0]
             mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
@@ -79,67 +102,13 @@ def download_song(song_title, artist, spotify_url=None):
                 os.rename(mp3_filename, safe_path)
             return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
     except Exception as e:
-        print(f"Tier 1 failed: {e}")
-
-    # --- Tier 2: ios / web_creator clients ---
-    print("Tier 2: Trying ios / web_creator clients...")
-    for client in ['ios', 'web_creator']:
-        opts = base_opts.copy()
-        opts['extractor_args'] = {**base_opts['extractor_args'], 'youtube': {'player_client': [client]}}
-        try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                url = spotify_url if spotify_url else f"ytsearch1:{song_title} {artist} official audio"
-                info = ydl.extract_info(url, download=True)
-                if 'entries' in info: info = info['entries'][0]
-                mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-                safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
-                safe_path = os.path.join(TEMP_DIR, safe_filename)
-                if os.path.exists(mp3_filename) and mp3_filename != safe_path:
-                    os.rename(mp3_filename, safe_path)
-                return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
-        except Exception as e:
-            print(f"Tier 2 ({client}) failed: {e}")
-
-    # --- Tier 3: Invidious API Fallback ---
-    print("Tier 3: Trying Invidious API fallback...")
-    # List of public Invidious instances (these change often)
-    invidious_instances = [
-        "https://inv.tux.pizza",
-        "https://invidious.io.lol",
-        "https://iv.melmac.space"
-    ]
-    for instance in invidious_instances:
-        try:
-            # Search for the video
-            search_url = f"{instance}/api/v1/search?q={song_title} {artist} official audio&type=video"
-            r = requests.get(search_url, timeout=10)
-            if r.status_code == 200:
-                data = r.json()
-                if data and len(data) > 0:
-                    video_id = data[0]['videoId']
-                    # Use yt-dlp to download the video ID via the Invidious instance
-                    opts = base_opts.copy()
-                    opts['extractor_args'] = {'youtube': {'player_client': ['web']}}
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        info = ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=True)
-                        mp3_filename = os.path.splitext(ydl.prepare_filename(info))[0] + ".mp3"
-                        safe_filename = os.path.basename(mp3_filename).replace(" ", "_")
-                        safe_path = os.path.join(TEMP_DIR, safe_filename)
-                        if os.path.exists(mp3_filename) and mp3_filename != safe_path:
-                            os.rename(mp3_filename, safe_path)
-                        print(f"Success via Invidious instance: {instance}")
-                        return safe_filename, info['title'], info.get('uploader', 'Unknown Artist')
-        except Exception as e:
-            print(f"Invidious instance {instance} failed: {e}")
-            continue
-
-    raise Exception("All download tiers failed. YouTube's datacenter block is too strong right now.")
+        print(f"Download failed: {e}")
+        raise e
 
 # --- ROUTES ---
 @app.route('/test', methods=['GET'])
 def test_pipeline():
     try:
-        # Using a known video for testing
         filename, title, artist = download_song("Never Gonna Give You Up", "Rick Astley", "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
         if push_to_codeberg(filename):
             return f"✅ SUCCESS! Downloaded '{title}' and pushed to Codeberg.", 200
@@ -157,6 +126,7 @@ def upload_file():
     safe_filename = file.filename.replace(" ", "_")
     file_path = os.path.join(TEMP_DIR, safe_filename)
     file.save(file_path)
+    
     if push_to_codeberg(safe_filename):
         if supabase:
             supabase.table('songs').insert({
@@ -176,6 +146,7 @@ def download_worker():
         if not supabase:
             time.sleep(10)
             continue
+
         try:
             response = supabase.table('songs').select('*').eq('status', 'pending').execute()
             for song in response.data:
